@@ -1,119 +1,52 @@
-// Fetch data from API
-async function fetchData() {
-    try {
-        const response = await fetch('/api/data');
-        const data = await response.json();
-        return data;
-    } catch (error) {
-        console.error('Error fetching data:', error);
-        return null;
-    }
-}
-
-// Initialize charts
-async function initCharts() {
-    const data = await fetchData();
+// Create falling brains animation
+function createFallingBrains() {
+    const container = document.getElementById('brainsContainer');
+    const brainEmoji = '🧠';
     
-    if (!data) {
-        console.error('Failed to load data');
-        return;
+    // Create initial brains
+    function createBrain() {
+        const brain = document.createElement('div');
+        brain.className = 'brain';
+        brain.textContent = brainEmoji;
+        
+        // Random horizontal position
+        const leftPosition = Math.random() * 100;
+        brain.style.left = leftPosition + '%';
+        
+        // Random delay for staggered effect
+        const delay = Math.random() * 2;
+        brain.style.animationDelay = delay + 's';
+        
+        // Random size variation
+        const size = 1.5 + Math.random() * 1;
+        brain.style.fontSize = size + 'rem';
+        
+        container.appendChild(brain);
+        
+        // Remove brain after animation completes
+        setTimeout(() => {
+            if (brain.parentNode) {
+                brain.parentNode.removeChild(brain);
+            }
+        }, 6000);
     }
-
-    // Calculate totals
-    const totalSales = data.sales.reduce((a, b) => a + b, 0);
-    const totalVisitors = data.visitors.reduce((a, b) => a + b, 0);
-    const totalRevenue = data.revenue.reduce((a, b) => a + b, 0);
-
-    // Update stat boxes
-    document.getElementById('totalSales').textContent = totalSales.toLocaleString();
-    document.getElementById('totalVisitors').textContent = totalVisitors.toLocaleString();
-    document.getElementById('totalRevenue').textContent = '$' + totalRevenue.toLocaleString();
-
-    // Chart configuration
-    const chartOptions = {
-        responsive: true,
-        maintainAspectRatio: true,
-        plugins: {
-            legend: {
-                display: true,
-                position: 'top',
-            },
-        },
-        scales: {
-            y: {
-                beginAtZero: true,
-                grid: {
-                    color: 'rgba(0, 0, 0, 0.05)',
-                },
-            },
-            x: {
-                grid: {
-                    display: false,
-                },
-            },
-        },
-    };
-
-    // Sales Chart (Line Chart)
-    const salesCtx = document.getElementById('salesChart').getContext('2d');
-    new Chart(salesCtx, {
-        type: 'line',
-        data: {
-            labels: data.labels,
-            datasets: [{
-                label: 'Sales',
-                data: data.sales,
-                borderColor: 'rgb(102, 126, 234)',
-                backgroundColor: 'rgba(102, 126, 234, 0.1)',
-                borderWidth: 3,
-                fill: true,
-                tension: 0.4,
-                pointRadius: 5,
-                pointHoverRadius: 7,
-            }],
-        },
-        options: chartOptions,
-    });
-
-    // Visitors Chart (Bar Chart)
-    const visitorsCtx = document.getElementById('visitorsChart').getContext('2d');
-    new Chart(visitorsCtx, {
-        type: 'bar',
-        data: {
-            labels: data.labels,
-            datasets: [{
-                label: 'Visitors',
-                data: data.visitors,
-                backgroundColor: 'rgba(118, 75, 162, 0.7)',
-                borderColor: 'rgb(118, 75, 162)',
-                borderWidth: 2,
-                borderRadius: 5,
-            }],
-        },
-        options: chartOptions,
-    });
-
-    // Revenue Chart (Area Chart)
-    const revenueCtx = document.getElementById('revenueChart').getContext('2d');
-    new Chart(revenueCtx, {
-        type: 'line',
-        data: {
-            labels: data.labels,
-            datasets: [{
-                label: 'Revenue ($)',
-                data: data.revenue,
-                borderColor: 'rgb(255, 99, 132)',
-                backgroundColor: 'rgba(255, 99, 132, 0.2)',
-                borderWidth: 3,
-                fill: true,
-                tension: 0.4,
-                pointRadius: 5,
-                pointHoverRadius: 7,
-            }],
-        },
-        options: chartOptions,
-    });
+    
+    // Create brains continuously
+    function spawnBrains() {
+        createBrain();
+        // Spawn a new brain every 300-800ms
+        const nextSpawn = 300 + Math.random() * 500;
+        setTimeout(spawnBrains, nextSpawn);
+    }
+    
+    // Start spawning brains
+    spawnBrains();
+    
+    // Create initial batch of brains
+    for (let i = 0; i < 10; i++) {
+        setTimeout(() => createBrain(), i * 200);
+    }
 }
 
 // Initialize when page loads
-document.addEventListener('DOMContentLoaded', initCharts);
+document.addEventListener('DOMContentLoaded', createFallingBrains);
