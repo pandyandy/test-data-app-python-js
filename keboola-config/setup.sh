@@ -1,7 +1,6 @@
 #!/bin/bash
-set -euo pipefail
+set -Eeuo pipefail
 
-echo "Installing dependencies..."
-cd /app
-uv sync
-echo "Setup complete."
+# Pure static JavaScript application - no dependencies to install
+# Static files are served directly by Nginx
+echo "Static JS app - no setup needed."
