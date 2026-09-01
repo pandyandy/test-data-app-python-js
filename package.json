@@ -1,0 +1,15 @@
+{
+  "name": "employee-data-app",
+  "version": "1.0.0",
+  "description": "Data app for viewing and editing out.c-data.employee-data via Keboola Storage Access.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}

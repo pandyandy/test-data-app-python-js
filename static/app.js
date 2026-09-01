@@ -1,52 +1,254 @@
-// Create falling brains animation
-function createFallingBrains() {
-    const container = document.getElementById('brainsContainer');
-    const brainEmoji = '🧠';
-    
-    // Create initial brains
-    function createBrain() {
-        const brain = document.createElement('div');
-        brain.className = 'brain';
-        brain.textContent = brainEmoji;
-        
-        // Random horizontal position
-        const leftPosition = Math.random() * 100;
-        brain.style.left = leftPosition + '%';
-        
-        // Random delay for staggered effect
-        const delay = Math.random() * 2;
-        brain.style.animationDelay = delay + 's';
-        
-        // Random size variation
-        const size = 1.5 + Math.random() * 1;
-        brain.style.fontSize = size + 'rem';
-        
-        container.appendChild(brain);
-        
-        // Remove brain after animation completes
-        setTimeout(() => {
-            if (brain.parentNode) {
-                brain.parentNode.removeChild(brain);
-            }
-        }, 6000);
+// Column layout is NOT hardcoded - it's discovered from whatever the API
+// returns (which itself is a live "SELECT *" against the table), so this UI
+// adapts to out.c-data.employee-data's real schema. The one assumption we
+// make (matching the backend) is that a column named "id" is the row key.
+const ID_COLUMN = 'id';
+
+const tableHead = document.getElementById('employeeTableHead');
+const tableBody = document.getElementById('employeeTableBody');
+const emptyState = document.getElementById('emptyState');
+const banner = document.getElementById('banner');
+const refreshBtn = document.getElementById('refreshBtn');
+const addRowBtn = document.getElementById('addRowBtn');
+const toggleLogBtn = document.getElementById('toggleLogBtn');
+const logPanel = document.getElementById('logPanel');
+const logList = document.getElementById('logList');
+
+let columns = [];
+let employees = [];
+let logPollHandle = null;
+
+function showBanner(message, type = 'info') {
+    banner.textContent = message;
+    banner.className = `banner ${type}`;
+    banner.hidden = false;
+}
+
+function hideBanner() {
+    banner.hidden = true;
+}
+
+function labelFor(column) {
+    return column
+        .replace(/[_-]+/g, ' ')
+        .replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+async function apiFetch(url, options) {
+    const res = await fetch(url, options);
+    let body = null;
+    try {
+        body = await res.json();
+    } catch {
+        // no JSON body
     }
-    
-    // Create brains continuously
-    function spawnBrains() {
-        createBrain();
-        // Spawn a new brain every 300-800ms
-        const nextSpawn = 300 + Math.random() * 500;
-        setTimeout(spawnBrains, nextSpawn);
+    if (!res.ok) {
+        const message = body?.error || `Request failed (${res.status})`;
+        throw new Error(message);
     }
-    
-    // Start spawning brains
-    spawnBrains();
-    
-    // Create initial batch of brains
-    for (let i = 0; i < 10; i++) {
-        setTimeout(() => createBrain(), i * 200);
+    return body;
+}
+
+function renderHead() {
+    const tr = document.createElement('tr');
+    columns.forEach((col) => {
+        const th = document.createElement('th');
+        th.textContent = labelFor(col);
+        tr.appendChild(th);
+    });
+    const th = document.createElement('th');
+    th.textContent = '';
+    tr.appendChild(th);
+    tableHead.innerHTML = '';
+    tableHead.appendChild(tr);
+}
+
+function renderRows() {
+    tableBody.innerHTML = '';
+    emptyState.hidden = employees.length > 0;
+    addRowBtn.disabled = columns.length === 0;
+
+    employees.forEach((employee, index) => {
+        tableBody.appendChild(buildRow(employee, index));
+    });
+}
+
+function buildRow(employee, index) {
+    const tr = document.createElement('tr');
+    if (employee.__isNew) tr.classList.add('is-new');
+
+    columns.forEach((col) => {
+        const td = document.createElement('td');
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.value = employee[col] ?? '';
+        input.disabled = col === ID_COLUMN;
+        if (col === ID_COLUMN && employee.__isNew) input.placeholder = '(auto)';
+        input.dataset.column = col;
+        input.addEventListener('input', () => {
+            employee[col] = input.value;
+            if (!employee.__isNew) tr.classList.add('is-dirty');
+        });
+        td.appendChild(input);
+        tr.appendChild(td);
+    });
+
+    const actionsTd = document.createElement('td');
+    const actionsWrap = document.createElement('div');
+    actionsWrap.className = 'row-actions';
+
+    const saveBtn = document.createElement('button');
+    saveBtn.className = 'btn btn-primary btn-small';
+    saveBtn.textContent = employee.__isNew ? 'Add' : 'Save';
+    saveBtn.addEventListener('click', () => saveRow(employee, saveBtn));
+    actionsWrap.appendChild(saveBtn);
+
+    if (employee.__isNew) {
+        const cancelBtn = document.createElement('button');
+        cancelBtn.className = 'btn btn-secondary btn-small';
+        cancelBtn.textContent = 'Cancel';
+        cancelBtn.addEventListener('click', () => {
+            employees.splice(index, 1);
+            renderRows();
+        });
+        actionsWrap.appendChild(cancelBtn);
+    }
+
+    actionsTd.appendChild(actionsWrap);
+    tr.appendChild(actionsTd);
+
+    return tr;
+}
+
+async function saveRow(employee, button) {
+    button.disabled = true;
+    hideBanner();
+    try {
+        const payload = {};
+        columns.forEach((col) => {
+            if (col === ID_COLUMN && employee.__isNew && !employee[col]) return;
+            payload[col] = employee[col] ?? '';
+        });
+
+        if (employee.__isNew) {
+            const created = await apiFetch('/api/employees', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+            });
+            showBanner(`Added employee ${created[ID_COLUMN]}.`, 'success');
+        } else {
+            delete payload[ID_COLUMN];
+            await apiFetch(`/api/employees/${encodeURIComponent(employee[ID_COLUMN])}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+            });
+            showBanner(`Saved changes to ${employee[ID_COLUMN]}.`, 'success');
+        }
+
+        await loadEmployees();
+        loadLogs();
+    } catch (err) {
+        showBanner(err.message, 'error');
+        button.disabled = false;
     }
 }
 
-// Initialize when page loads
-document.addEventListener('DOMContentLoaded', createFallingBrains);
+function addBlankRow() {
+    if (columns.length === 0) return;
+    const blank = { __isNew: true };
+    columns.forEach((col) => {
+        blank[col] = '';
+    });
+    employees.push(blank);
+    renderRows();
+    tableBody.lastElementChild?.querySelector('input:not(:disabled)')?.focus();
+}
+
+async function loadEmployees() {
+    try {
+        const data = await apiFetch('/api/employees');
+        employees = data.employees || [];
+        columns = data.columns && data.columns.length
+            ? data.columns
+            : (employees.length ? Object.keys(employees[0]) : columns);
+        renderHead();
+        renderRows();
+    } catch (err) {
+        showBanner(err.message, 'error');
+    }
+}
+
+async function loadStatus() {
+    try {
+        const data = await apiFetch('/api/status');
+        const status = data.storageAccess;
+        const missing = Object.entries(status)
+            .filter(([, ok]) => !ok)
+            .map(([key]) => key);
+        if (missing.length) {
+            showBanner(
+                `Storage Access isn't fully configured yet (missing: ${missing.join(', ')}). ` +
+                'Enable it in the app\'s Advanced Settings and select out.c-data.employee-data, then redeploy.',
+                'error'
+            );
+        }
+    } catch {
+        // status endpoint failing isn't fatal to the UI
+    }
+}
+
+function renderLogs(logs) {
+    logList.innerHTML = '';
+    logs.forEach((entry) => {
+        const li = document.createElement('li');
+        li.className = `level-${entry.level}`;
+        const time = document.createElement('span');
+        time.textContent = new Date(entry.ts).toLocaleTimeString();
+        const event = document.createElement('span');
+        event.className = 'log-event';
+        event.textContent = entry.event;
+        li.appendChild(time);
+        li.appendChild(event);
+        if (entry.id) {
+            const idSpan = document.createElement('span');
+            idSpan.textContent = entry.id;
+            li.appendChild(idSpan);
+        }
+        logList.appendChild(li);
+    });
+}
+
+async function loadLogs() {
+    try {
+        const data = await apiFetch('/api/logs');
+        renderLogs(data.logs || []);
+    } catch {
+        // ignore log-fetch failures
+    }
+}
+
+refreshBtn.addEventListener('click', () => {
+    hideBanner();
+    loadEmployees();
+});
+
+addRowBtn.addEventListener('click', addBlankRow);
+
+toggleLogBtn.addEventListener('click', () => {
+    const show = logPanel.hidden;
+    logPanel.hidden = !show;
+    toggleLogBtn.textContent = show ? 'Hide' : 'Show';
+    if (show) {
+        loadLogs();
+        logPollHandle = setInterval(loadLogs, 5000);
+    } else if (logPollHandle) {
+        clearInterval(logPollHandle);
+        logPollHandle = null;
+    }
+});
+
+renderHead();
+loadStatus();
+loadEmployees();

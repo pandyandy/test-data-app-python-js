@@ -1,6 +1,6 @@
 #!/bin/bash
 set -Eeuo pipefail
 
-# Pure static JavaScript application - no dependencies to install
-# Static files are served directly by Nginx
-echo "Static JS app - no setup needed."
+echo "Installing Node dependencies..."
+cd /app
+npm install --omit=dev

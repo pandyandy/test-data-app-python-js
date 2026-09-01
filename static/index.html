@@ -1,16 +1,48 @@
 <!DOCTYPE html>
-<html lang="cs">
+<html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Vojto, takhle se to dělá</title>
+    <title>Employee Data</title>
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
-    <div class="brains-container" id="brainsContainer"></div>
-    <div class="main-content">
-        <h1 class="main-text">vojto, takhle se to dělá</h1>
+    <div class="app">
+        <header class="app-header">
+            <h1>Employee Data</h1>
+            <p class="subtitle">out.c-data.employee-data &mdash; live via Keboola Storage Access</p>
+        </header>
+
+        <div id="banner" class="banner" hidden></div>
+
+        <section class="panel">
+            <div class="panel-header">
+                <h2>Employees</h2>
+                <div class="panel-actions">
+                    <button id="refreshBtn" class="btn btn-secondary">Refresh</button>
+                    <button id="addRowBtn" class="btn btn-primary">Add employee</button>
+                </div>
+            </div>
+            <div class="table-wrap">
+                <table id="employeeTable">
+                    <thead id="employeeTableHead"></thead>
+                    <tbody id="employeeTableBody"></tbody>
+                </table>
+            </div>
+            <p id="emptyState" class="empty-state" hidden>No employees yet. Click "Add employee" to create the first row.</p>
+        </section>
+
+        <section class="panel">
+            <div class="panel-header">
+                <h2>Activity log</h2>
+                <button id="toggleLogBtn" class="btn btn-secondary">Show</button>
+            </div>
+            <div id="logPanel" class="log-panel" hidden>
+                <ul id="logList"></ul>
+            </div>
+        </section>
     </div>
+
     <script src="app.js"></script>
 </body>
 </html>
