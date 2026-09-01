@@ -130,6 +130,7 @@ function buildRow(employee, index) {
 async function saveRow(employee, button) {
     button.disabled = true;
     hideBanner();
+    openLogPanel();
     try {
         const payload = {};
         columns.forEach((col) => {
@@ -159,6 +160,7 @@ async function saveRow(employee, button) {
     } catch (err) {
         showBanner(err.message, 'error');
         button.disabled = false;
+        loadLogs();
     }
 }
 
@@ -243,16 +245,29 @@ refreshBtn.addEventListener('click', () => {
 
 addRowBtn.addEventListener('click', addBlankRow);
 
-toggleLogBtn.addEventListener('click', () => {
-    const show = logPanel.hidden;
-    logPanel.hidden = !show;
-    toggleLogBtn.textContent = show ? 'Hide' : 'Show';
-    if (show) {
-        loadLogs();
+function openLogPanel() {
+    logPanel.hidden = false;
+    toggleLogBtn.textContent = 'Hide';
+    loadLogs();
+    if (!logPollHandle) {
         logPollHandle = setInterval(loadLogs, 5000);
-    } else if (logPollHandle) {
+    }
+}
+
+function closeLogPanel() {
+    logPanel.hidden = true;
+    toggleLogBtn.textContent = 'Show';
+    if (logPollHandle) {
         clearInterval(logPollHandle);
         logPollHandle = null;
+    }
+}
+
+toggleLogBtn.addEventListener('click', () => {
+    if (logPanel.hidden) {
+        openLogPanel();
+    } else {
+        closeLogPanel();
     }
 });
 
