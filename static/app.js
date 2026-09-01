@@ -128,9 +128,19 @@ function buildRow(employee, index) {
 }
 
 async function saveRow(employee, button) {
+    const originalLabel = button.textContent;
+    const startedAt = performance.now();
+    const elapsedSeconds = () => ((performance.now() - startedAt) / 1000).toFixed(1);
+
     button.disabled = true;
     hideBanner();
     openLogPanel();
+
+    const ticker = setInterval(() => {
+        button.textContent = `Saving… ${elapsedSeconds()}s`;
+    }, 100);
+    button.textContent = `Saving… 0.0s`;
+
     try {
         const payload = {};
         columns.forEach((col) => {
@@ -144,7 +154,7 @@ async function saveRow(employee, button) {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(payload),
             });
-            showBanner(`Added employee ${created[ID_COLUMN]}.`, 'success');
+            showBanner(`Added employee ${created[ID_COLUMN]} in ${elapsedSeconds()}s.`, 'success');
         } else {
             delete payload[ID_COLUMN];
             await apiFetch(`/api/employees/${encodeURIComponent(employee[ID_COLUMN])}`, {
@@ -152,15 +162,18 @@ async function saveRow(employee, button) {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(payload),
             });
-            showBanner(`Saved changes to ${employee[ID_COLUMN]}.`, 'success');
+            showBanner(`Saved changes to ${employee[ID_COLUMN]} in ${elapsedSeconds()}s.`, 'success');
         }
 
         await loadEmployees();
         loadLogs();
     } catch (err) {
-        showBanner(err.message, 'error');
+        showBanner(`${err.message} (after ${elapsedSeconds()}s)`, 'error');
         button.disabled = false;
+        button.textContent = originalLabel;
         loadLogs();
+    } finally {
+        clearInterval(ticker);
     }
 }
 
