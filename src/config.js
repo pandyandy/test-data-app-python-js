@@ -15,10 +15,21 @@ const TABLE_ID = `${TABLE_SCHEMA}.${TABLE_NAME}`;
 // target UPDATE statements and to auto-generate an id for new rows.
 const ID_COLUMN = 'id';
 
+// Keboola-managed Storage tables can carry internal bookkeeping columns
+// (e.g. "_timestamp" for row versioning) alongside the real data columns.
+// These are maintained by the platform's own write path - writing to them
+// directly over SQL can fail (their stored representation isn't always a
+// value Snowflake will implicitly cast back in a plain UPDATE/INSERT). Treat
+// any underscore-prefixed column as read-only/hidden.
+function isSystemColumn(name) {
+  return typeof name === 'string' && name.startsWith('_');
+}
+
 module.exports = {
   TABLE_SCHEMA,
   TABLE_NAME,
   TABLE_ID,
   ID_COLUMN,
+  isSystemColumn,
   PORT: process.env.PORT || 3000,
 };

@@ -1,18 +1,29 @@
 const express = require('express');
 const queryService = require('../queryService');
 const logger = require('../logger');
-const { TABLE_SCHEMA, TABLE_NAME, ID_COLUMN } = require('../config');
+const { TABLE_SCHEMA, TABLE_NAME, ID_COLUMN, isSystemColumn } = require('../config');
 
 const router = express.Router();
 
 const tableRef = `${queryService.sqlIdent(TABLE_SCHEMA)}.${queryService.sqlIdent(TABLE_NAME)}`;
 
-// GET /api/employees - list all rows, with whatever columns the table has.
+function stripSystemColumns(obj) {
+  const clean = {};
+  for (const [key, value] of Object.entries(obj)) {
+    if (!isSystemColumn(key)) clean[key] = value;
+  }
+  return clean;
+}
+
+// GET /api/employees - list all rows, with whatever (non-system) columns the table has.
 router.get('/', async (req, res) => {
   try {
     const sql = `SELECT * FROM ${tableRef} ORDER BY ${queryService.sqlIdent(ID_COLUMN)}`;
     const result = await queryService.executeQuery(sql, { queryName: 'List employees' });
-    res.json({ columns: result.columns, employees: result.rows });
+    res.json({
+      columns: result.columns.filter((c) => !isSystemColumn(c)),
+      employees: result.rows.map(stripSystemColumns),
+    });
   } catch (err) {
     logger.error('employees:list-failed', { error: err.message });
     res.status(err.status || 500).json({ error: err.message, details: err.body });
@@ -23,7 +34,7 @@ router.get('/', async (req, res) => {
 // whatever columns the table has. "id" is auto-generated if omitted.
 router.post('/', async (req, res) => {
   try {
-    const payload = { ...(req.body || {}) };
+    const payload = stripSystemColumns(req.body || {});
     if (!payload[ID_COLUMN]) {
       payload[ID_COLUMN] = `emp-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
     }
@@ -50,7 +61,7 @@ router.post('/', async (req, res) => {
 router.put('/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const payload = { ...(req.body || {}) };
+    const payload = stripSystemColumns(req.body || {});
     delete payload[ID_COLUMN];
 
     const columns = Object.keys(payload);
