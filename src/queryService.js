@@ -3,20 +3,23 @@
 // through a job/input-output mapping. See:
 // https://help.keboola.com/data-apps/reference/#storage-access
 //
-// IMPORTANT - verify against your deployment:
-// This module was written without a live deployment to test against (this
-// session only had read access to the Keboola project). The environment
-// variables below are the ones Keboola documents for Storage Access, but the
-// exact request/response shape of the Query Service HTTP API is our best
-// reasonable guess at Keboola's REST conventions, not something we've
-// confirmed by calling it. The FIRST time this app runs for real with
-// Storage Access enabled:
-//   1. Check the app logs for the "query-service:request" / "query-service:response"
-//      entries this module writes on every call.
-//   2. If a query fails, the error log includes the raw response body - use it
-//      to correct `QUERY_SERVICE_PATH` / the request body shape below.
-// Everything Query-Service-specific is isolated in this one file so that fix
-// is a small, local change.
+// This module is written against the live OpenAPI spec served by the Query
+// Service itself (GET https://query.keboola.com/ -> apiDocs ->
+// /api/v1/documentation/swagger.json), confirmed 2026-09-01. The API is
+// async: submit a query job, poll its status, then fetch the results of each
+// statement once the job completes.
+//
+//   1. POST   /api/v1/branches/{branchId}/workspaces/{workspaceId}/queries
+//             body: { statements: string[], transactional: boolean, ... }
+//             -> { queryJobId }
+//   2. GET    /api/v1/queries/{queryJobId}
+//             -> { status: created|enqueued|processing|canceled|completed|failed,
+//                  statements: [{ id, status, error, ... }] }
+//             poll until status is completed/failed/canceled.
+//   3. GET    /api/v1/queries/{queryJobId}/{statementId}/results?offset&pageSize
+//             -> { status, columns: [{name,...}], data: string[][], numberOfRows }
+//
+// Auth: header "X-StorageAPI-Token" with the Storage API token (KBC_TOKEN).
 
 const fs = require('fs');
 const logger = require('./logger');
@@ -26,6 +29,10 @@ const KBC_TOKEN = process.env.KBC_TOKEN;
 const BRANCH_ID = process.env.BRANCH_ID;
 const WORKSPACE_MANIFEST_PATH = process.env.KBC_WORKSPACE_MANIFEST_PATH;
 const WORKSPACE_ID_ENV = process.env.WORKSPACE_ID;
+
+const POLL_INTERVAL_MS = 300;
+const POLL_TIMEOUT_MS = 30000;
+const RESULTS_PAGE_SIZE = 500;
 
 let cachedWorkspaceId = null;
 
@@ -58,7 +65,7 @@ function getWorkspaceId() {
 }
 
 function isConfigured() {
-  return Boolean(QUERY_SERVICE_URL && KBC_TOKEN && getWorkspaceId());
+  return Boolean(QUERY_SERVICE_URL && KBC_TOKEN && BRANCH_ID && getWorkspaceId());
 }
 
 function configStatus() {
@@ -85,12 +92,100 @@ function sqlIdent(name) {
   return `"${String(name).replace(/"/g, '""')}"`;
 }
 
+async function apiRequest(method, path, body) {
+  const url = `${QUERY_SERVICE_URL.replace(/\/+$/, '')}${path}`;
+  let response;
+  try {
+    response = await fetch(url, {
+      method,
+      headers: {
+        'Content-Type': 'application/json',
+        'X-StorageAPI-Token': KBC_TOKEN,
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+  } catch (err) {
+    logger.error('query-service:network-error', { method, url, error: err.message });
+    throw err;
+  }
+
+  const bodyText = await response.text();
+  let parsed;
+  try {
+    parsed = bodyText ? JSON.parse(bodyText) : null;
+  } catch {
+    parsed = bodyText;
+  }
+
+  if (!response.ok) {
+    logger.error('query-service:response-error', { method, url, status: response.status, body: parsed });
+    const err = new Error(parsed?.exception || `Query Service returned ${response.status}`);
+    err.code = 'QUERY_SERVICE_ERROR';
+    err.status = response.status;
+    err.body = parsed;
+    throw err;
+  }
+
+  return parsed;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForJob(queryJobId) {
+  const deadline = Date.now() + POLL_TIMEOUT_MS;
+  for (;;) {
+    const job = await apiRequest('GET', `/api/v1/queries/${queryJobId}`);
+    if (['completed', 'failed', 'canceled'].includes(job.status)) {
+      return job;
+    }
+    if (Date.now() > deadline) {
+      const err = new Error(`Timed out waiting for query job ${queryJobId} (last status: ${job.status})`);
+      err.code = 'QUERY_SERVICE_TIMEOUT';
+      throw err;
+    }
+    await sleep(POLL_INTERVAL_MS);
+  }
+}
+
+async function fetchAllResults(queryJobId, statementId) {
+  const columns = [];
+  const rows = [];
+  let offset = 0;
+
+  for (;;) {
+    const page = await apiRequest(
+      'GET',
+      `/api/v1/queries/${queryJobId}/${statementId}/results?offset=${offset}&pageSize=${RESULTS_PAGE_SIZE}`
+    );
+
+    if (offset === 0) {
+      (page.columns || []).forEach((c) => columns.push(c.name));
+    }
+
+    const data = page.data || [];
+    data.forEach((rowValues) => {
+      const row = {};
+      columns.forEach((colName, i) => {
+        row[colName] = rowValues[i];
+      });
+      rows.push(row);
+    });
+
+    if (data.length < RESULTS_PAGE_SIZE) break;
+    offset += RESULTS_PAGE_SIZE;
+  }
+
+  return { columns, rows };
+}
+
 async function executeQuery(sql, { queryName } = {}) {
   if (!isConfigured()) {
     const status = configStatus();
     logger.error('query-service:not-configured', status);
     const err = new Error(
-      'Storage Access is not configured for this app (missing QUERY_SERVICE_URL / KBC_TOKEN / workspace id). ' +
+      'Storage Access is not configured for this app (missing QUERY_SERVICE_URL / KBC_TOKEN / BRANCH_ID / workspace id). ' +
         'Enable Storage Access + select out.c-data.employee-data in the app\'s Advanced Settings, then redeploy.'
     );
     err.code = 'QUERY_SERVICE_NOT_CONFIGURED';
@@ -98,87 +193,36 @@ async function executeQuery(sql, { queryName } = {}) {
   }
 
   const workspaceId = getWorkspaceId();
-  const url = `${QUERY_SERVICE_URL.replace(/\/+$/, '')}/branch/${BRANCH_ID}/workspace/${workspaceId}/query`;
+  logger.info('query-service:submit', { queryName, sql });
 
-  logger.info('query-service:request', { queryName, sql, url });
+  const submitted = await apiRequest(
+    'POST',
+    `/api/v1/branches/${BRANCH_ID}/workspaces/${workspaceId}/queries`,
+    { statements: [sql], transactional: true }
+  );
 
-  let response;
-  try {
-    response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-StorageApi-Token': KBC_TOKEN,
-      },
-      body: JSON.stringify({ statements: [sql] }),
-    });
-  } catch (err) {
-    logger.error('query-service:network-error', { queryName, url, error: err.message });
+  const job = await waitForJob(submitted.queryJobId);
+  const statement = job.statements?.[0];
+
+  if (job.status !== 'completed' || statement?.status === 'failed') {
+    logger.error('query-service:job-failed', { queryName, queryJobId: submitted.queryJobId, job });
+    const err = new Error(statement?.error || `Query job ${job.status}`);
+    err.code = 'QUERY_SERVICE_JOB_FAILED';
     throw err;
   }
 
-  const bodyText = await response.text();
-  let body;
-  try {
-    body = bodyText ? JSON.parse(bodyText) : null;
-  } catch {
-    body = bodyText;
+  logger.info('query-service:job-completed', {
+    queryName,
+    queryJobId: submitted.queryJobId,
+    rowsAffected: statement?.rowsAffected,
+    numberOfRows: statement?.numberOfRows,
+  });
+
+  if (!statement?.id) {
+    return { columns: [], rows: [] };
   }
 
-  if (!response.ok) {
-    logger.error('query-service:response-error', {
-      queryName,
-      status: response.status,
-      body,
-    });
-    const err = new Error(`Query Service returned ${response.status}`);
-    err.code = 'QUERY_SERVICE_ERROR';
-    err.status = response.status;
-    err.body = body;
-    throw err;
-  }
-
-  logger.info('query-service:response', { queryName, status: response.status });
-
-  return normalizeResult(body);
-}
-
-// The Query Service response shape isn't confirmed from a live call (see the
-// module header). This accepts a few plausible shapes for a single-statement
-// call and always returns { columns: string[], rows: object[] }.
-function normalizeResult(body) {
-  if (!body) return { columns: [], rows: [] };
-
-  const candidate = Array.isArray(body?.results) ? body.results[0] : body;
-
-  if (Array.isArray(candidate?.rows) && Array.isArray(candidate?.columns)) {
-    const columns = candidate.columns;
-    const rows = candidate.rows.map((row) => {
-      if (Array.isArray(row)) {
-        const obj = {};
-        columns.forEach((col, i) => {
-          obj[col] = row[i];
-        });
-        return obj;
-      }
-      return row;
-    });
-    return { columns, rows };
-  }
-
-  if (Array.isArray(candidate?.data)) {
-    const rows = candidate.data;
-    const columns = rows.length ? Object.keys(rows[0]) : [];
-    return { columns, rows };
-  }
-
-  if (Array.isArray(body)) {
-    const columns = body.length ? Object.keys(body[0]) : [];
-    return { columns, rows: body };
-  }
-
-  logger.warn('query-service:unrecognized-result-shape', { bodyPreview: JSON.stringify(body).slice(0, 500) });
-  return { columns: [], rows: [] };
+  return fetchAllResults(submitted.queryJobId, statement.id);
 }
 
 module.exports = {
