@@ -141,11 +141,13 @@ function sleep(ms) {
 async function waitForJob(queryJobId) {
   const deadline = Date.now() + POLL_TIMEOUT_MS;
   let interval = POLL_INTERVAL_START_MS;
+  let pollCount = 0;
 
   for (;;) {
+    pollCount += 1;
     const job = await apiRequest('GET', `/api/v1/queries/${queryJobId}`);
     if (['completed', 'failed', 'canceled'].includes(job.status)) {
-      return job;
+      return { job, pollCount };
     }
     if (Date.now() > deadline) {
       const err = new Error(`Timed out waiting for query job ${queryJobId} (last status: ${job.status})`);
@@ -155,6 +157,21 @@ async function waitForJob(queryJobId) {
     await sleep(interval);
     interval = Math.min(interval * POLL_INTERVAL_BACKOFF, POLL_INTERVAL_MAX_MS);
   }
+}
+
+// Statement timestamps (createdAt/executedAt/completedAt) are set server-side
+// by the Query Service, so they tell us how the time actually split between
+// "queued" and "executing in Snowflake" - independent of our own network/poll
+// overhead. Best-effort: log whatever parses, don't fail the request over it.
+function statementTiming(statement) {
+  const parse = (v) => (v ? new Date(v).getTime() : null);
+  const created = parse(statement?.createdAt);
+  const executed = parse(statement?.executedAt);
+  const completed = parse(statement?.completedAt);
+  const timing = {};
+  if (created && executed) timing.queuedMs = executed - created;
+  if (executed && completed) timing.executingMs = completed - executed;
+  return timing;
 }
 
 async function fetchAllResults(queryJobId, statementId) {
@@ -203,13 +220,16 @@ async function executeQuery(sql, { queryName } = {}) {
   const workspaceId = getWorkspaceId();
   logger.info('query-service:submit', { queryName, sql });
 
+  const t0 = Date.now();
   const submitted = await apiRequest(
     'POST',
     `/api/v1/branches/${BRANCH_ID}/workspaces/${workspaceId}/queries`,
     { statements: [sql], transactional: true }
   );
+  const t1 = Date.now();
 
-  const job = await waitForJob(submitted.queryJobId);
+  const { job, pollCount } = await waitForJob(submitted.queryJobId);
+  const t2 = Date.now();
   const statement = job.statements?.[0];
 
   if (job.status !== 'completed' || statement?.status === 'failed') {
@@ -219,22 +239,34 @@ async function executeQuery(sql, { queryName } = {}) {
     throw err;
   }
 
+  // INSERT/UPDATE/DELETE callers only care that the statement succeeded
+  // (rowsAffected, already known from the job status above) - skip the
+  // extra results round-trip that only SELECT callers actually need.
+  const isSelect = /^\s*select\b/i.test(sql);
+  let result;
+  if (!isSelect || !statement?.id) {
+    result = { columns: [], rows: [], rowsAffected: statement?.rowsAffected ?? 0 };
+  } else {
+    result = await fetchAllResults(submitted.queryJobId, statement.id);
+  }
+  const t3 = Date.now();
+
   logger.info('query-service:job-completed', {
     queryName,
     queryJobId: submitted.queryJobId,
     rowsAffected: statement?.rowsAffected,
     numberOfRows: statement?.numberOfRows,
+    timingMs: {
+      submit: t1 - t0,
+      pollWait: t2 - t1,
+      pollCount,
+      results: t3 - t2,
+      total: t3 - t0,
+      ...statementTiming(statement),
+    },
   });
 
-  // INSERT/UPDATE/DELETE callers only care that the statement succeeded
-  // (rowsAffected, already known from the job status above) - skip the
-  // extra results round-trip that only SELECT callers actually need.
-  const isSelect = /^\s*select\b/i.test(sql);
-  if (!isSelect || !statement?.id) {
-    return { columns: [], rows: [], rowsAffected: statement?.rowsAffected ?? 0 };
-  }
-
-  return fetchAllResults(submitted.queryJobId, statement.id);
+  return result;
 }
 
 module.exports = {
