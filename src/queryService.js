@@ -30,7 +30,12 @@ const BRANCH_ID = process.env.BRANCH_ID;
 const WORKSPACE_MANIFEST_PATH = process.env.KBC_WORKSPACE_MANIFEST_PATH;
 const WORKSPACE_ID_ENV = process.env.WORKSPACE_ID;
 
-const POLL_INTERVAL_MS = 300;
+// Poll cadence for waitForJob: start fast so quick statements (most
+// INSERT/UPDATE calls) are noticed almost immediately, then back off so
+// slower queries don't hammer the API while they run.
+const POLL_INTERVAL_START_MS = 100;
+const POLL_INTERVAL_MAX_MS = 1000;
+const POLL_INTERVAL_BACKOFF = 1.5;
 const POLL_TIMEOUT_MS = 30000;
 const RESULTS_PAGE_SIZE = 500;
 
@@ -135,6 +140,8 @@ function sleep(ms) {
 
 async function waitForJob(queryJobId) {
   const deadline = Date.now() + POLL_TIMEOUT_MS;
+  let interval = POLL_INTERVAL_START_MS;
+
   for (;;) {
     const job = await apiRequest('GET', `/api/v1/queries/${queryJobId}`);
     if (['completed', 'failed', 'canceled'].includes(job.status)) {
@@ -145,7 +152,8 @@ async function waitForJob(queryJobId) {
       err.code = 'QUERY_SERVICE_TIMEOUT';
       throw err;
     }
-    await sleep(POLL_INTERVAL_MS);
+    await sleep(interval);
+    interval = Math.min(interval * POLL_INTERVAL_BACKOFF, POLL_INTERVAL_MAX_MS);
   }
 }
 
@@ -218,8 +226,12 @@ async function executeQuery(sql, { queryName } = {}) {
     numberOfRows: statement?.numberOfRows,
   });
 
-  if (!statement?.id) {
-    return { columns: [], rows: [] };
+  // INSERT/UPDATE/DELETE callers only care that the statement succeeded
+  // (rowsAffected, already known from the job status above) - skip the
+  // extra results round-trip that only SELECT callers actually need.
+  const isSelect = /^\s*select\b/i.test(sql);
+  if (!isSelect || !statement?.id) {
+    return { columns: [], rows: [], rowsAffected: statement?.rowsAffected ?? 0 };
   }
 
   return fetchAllResults(submitted.queryJobId, statement.id);
