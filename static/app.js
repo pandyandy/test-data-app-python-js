@@ -77,6 +77,18 @@ function buildRow(employee, index) {
     const tr = document.createElement('tr');
     if (employee.__isNew) tr.classList.add('is-new');
 
+    const actionsTd = document.createElement('td');
+    const actionsWrap = document.createElement('div');
+    actionsWrap.className = 'row-actions';
+
+    const saveBtn = document.createElement('button');
+    saveBtn.className = 'btn btn-primary btn-small';
+    saveBtn.textContent = employee.__isNew ? 'Add' : 'Save';
+    // For an existing row, the Save button only shows up once something has
+    // actually changed - not on every untouched row.
+    saveBtn.hidden = !employee.__isNew;
+    saveBtn.addEventListener('click', () => saveRow(employee, saveBtn));
+
     columns.forEach((col) => {
         const td = document.createElement('td');
         const input = document.createElement('input');
@@ -87,20 +99,15 @@ function buildRow(employee, index) {
         input.dataset.column = col;
         input.addEventListener('input', () => {
             employee[col] = input.value;
-            if (!employee.__isNew) tr.classList.add('is-dirty');
+            if (!employee.__isNew) {
+                tr.classList.add('is-dirty');
+                saveBtn.hidden = false;
+            }
         });
         td.appendChild(input);
         tr.appendChild(td);
     });
 
-    const actionsTd = document.createElement('td');
-    const actionsWrap = document.createElement('div');
-    actionsWrap.className = 'row-actions';
-
-    const saveBtn = document.createElement('button');
-    saveBtn.className = 'btn btn-primary btn-small';
-    saveBtn.textContent = employee.__isNew ? 'Add' : 'Save';
-    saveBtn.addEventListener('click', () => saveRow(employee, saveBtn));
     actionsWrap.appendChild(saveBtn);
 
     if (employee.__isNew) {
