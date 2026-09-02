@@ -23,6 +23,18 @@ router.post('/chat', async (req, res) => {
   }
 });
 
+// GET /api/chat/:chatId - fetch the chat's current messages as a plain JSON
+// response (not a stream). Used by the frontend to recover an answer after
+// a dropped streaming connection - see src/kaiService.js#fetchChat.
+router.get('/chat/:chatId', async (req, res) => {
+  try {
+    const data = await kaiService.fetchChat(req.params.chatId);
+    res.json(data);
+  } catch (err) {
+    handleProxyError(err, res, 'kai:fetch-chat-failed');
+  }
+});
+
 // POST /api/chat/:chatId/:action/:approvalId - resume a chat after a write
 // tool paused for approval. :action is "approve" or "reject"; either way we
 // send a tool-approval-response message and stream the continuation back.

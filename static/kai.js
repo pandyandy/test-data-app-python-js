@@ -108,27 +108,75 @@ function addChatError(text) {
     scrollChatToBottom();
 }
 
-// Like addChatError, but with a Retry button - used when the connection
-// itself dropped (as opposed to Kai returning an error response), so the
-// user's question is still worth resending rather than retyping.
-function addChatErrorWithRetry(text, onRetry) {
+// Like addChatError, but with action buttons - used when the connection
+// itself dropped (as opposed to Kai returning an error response). `actions`
+// is [{ label, onClick }]; each click removes the error and runs its action.
+function addChatErrorWithActions(text, actions) {
     const div = document.createElement('div');
     div.className = 'chat-error';
     const message = document.createElement('span');
     message.textContent = text;
     div.appendChild(message);
 
-    const retryBtn = document.createElement('button');
-    retryBtn.className = 'btn btn-secondary btn-small chat-retry-btn';
-    retryBtn.textContent = 'Retry';
-    retryBtn.addEventListener('click', () => {
-        div.remove();
-        onRetry();
+    actions.forEach(({ label, onClick }) => {
+        const btn = document.createElement('button');
+        btn.className = 'btn btn-secondary btn-small chat-retry-btn';
+        btn.textContent = label;
+        btn.addEventListener('click', () => {
+            div.remove();
+            onClick();
+        });
+        div.appendChild(btn);
     });
-    div.appendChild(retryBtn);
 
     chatMessages.appendChild(div);
     scrollChatToBottom();
+}
+
+// kai-assistant keeps working on a request server-side even after our
+// proxied SSE connection to it drops, so a plain (non-streaming, so not
+// subject to whatever cut the stream short) GET can often recover an answer
+// that finished after the browser already saw a connection error. Message
+// shape follows the same { role, parts: [{ type: 'text', text }] } form we
+// send our own messages in.
+async function fetchRecoveredAnswer() {
+    try {
+        const res = await fetch(`/api/chat/${chatId}`);
+        if (!res.ok) return null;
+        const data = await res.json();
+        const messages = Array.isArray(data.messages) ? data.messages : [];
+        const lastAssistant = [...messages].reverse().find((m) => m && m.role === 'assistant');
+        if (!lastAssistant || !Array.isArray(lastAssistant.parts)) return null;
+        const text = lastAssistant.parts
+            .filter((p) => p && p.type === 'text' && typeof p.text === 'string')
+            .map((p) => p.text)
+            .join('');
+        return text || null;
+    } catch {
+        return null;
+    }
+}
+
+// Looks up whether Kai actually finished the answer despite the dropped
+// connection, and either renders it or offers to check again / retry.
+async function checkIfFinished(content, accumulatedRef, originalText) {
+    setStreaming(true);
+    const recovered = await fetchRecoveredAnswer();
+
+    if (recovered) {
+        const finalContent = accumulatedRef.text ? content : createAssistantMessage();
+        const { body, suggestions } = extractSuggestions(recovered);
+        finalContent.innerHTML = renderMarkdown(body);
+        if (suggestions.length) renderSuggestions(suggestions);
+    } else {
+        addChatErrorWithActions("Kai hasn't finished yet, or the answer couldn't be recovered.", [
+            { label: 'Check again', onClick: () => checkIfFinished(content, accumulatedRef, originalText) },
+            { label: 'Retry', onClick: () => sendMessage(originalText) },
+        ]);
+    }
+
+    setStreaming(false);
+    chatInput.focus();
 }
 
 function renderSuggestions(suggestions) {
@@ -281,14 +329,20 @@ async function sendMessage(text) {
         }
     } catch (err) {
         // The connection dropped mid-stream rather than Kai returning an
-        // error - keep whatever text made it through (if any) and offer a
-        // retry instead of silently discarding the question.
+        // error - keep whatever text made it through (if any). Kai itself
+        // may well have kept working after our stream to it was cut, so
+        // offer to check for a finished answer before falling back to
+        // resending the question.
         if (accumulatedRef.text) {
             content.innerHTML = renderMarkdown(accumulatedRef.text);
         } else {
             content.remove();
         }
-        addChatErrorWithRetry(`Connection error: ${err.message}`, () => sendMessage(text));
+
+        addChatErrorWithActions(`Connection error: ${err.message}`, [
+            { label: 'Check if it finished', onClick: () => checkIfFinished(content, accumulatedRef, text) },
+            { label: 'Retry', onClick: () => sendMessage(text) },
+        ]);
     }
 
     setStreaming(false);
