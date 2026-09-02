@@ -8,23 +8,31 @@
 // separate approval endpoint - pointing discovery at it without also
 // rewriting the approval flow would leave write-tool calls hanging forever.
 //
-// Flow: discover the kai-assistant service URL from the Storage API's own
-// service list (GET /v2/storage), then forward chat requests to it with the
-// auth headers attached, streaming the SSE response straight back to the
-// caller.
+// Architecture: the Keboola Data Apps platform proxy in front of this app
+// (apps-proxy) enforces a hard 30s timeout on any plain HTTP request,
+// regardless of how much data is flowing - streaming/heartbeats don't
+// exempt it, only WebSockets get a long (6h) timeout there. Confirmed via
+// platform traces: a real Kai answer involving several tool calls took just
+// over 30s and got its connection cut mid-response even though kai-assistant
+// itself completed the request successfully. So holding one HTTP request
+// open from browser to server for the whole answer is not viable here.
+//
+// Instead: startChat() kicks off the request to kai-assistant in the
+// background and returns a streamId immediately; the SSE response is parsed
+// into discrete events and buffered in memory (readStreamEvents below serves
+// them). The frontend polls for new events every ~1.2s instead of holding a
+// connection open - every individual request, in both directions, finishes
+// in well under a second, so the 30s cap never applies to anything.
 
+const crypto = require('crypto');
 const { Agent } = require('undici');
 const logger = require('./logger');
 const { getWorkspaceId } = require('./queryService');
 
-// Node's built-in fetch (undici) defaults to killing a request after 300s
-// without any bytes received - headers or body. A complex Kai answer can go
-// quiet for longer than that while it's thinking or running a tool, which
-// would otherwise abort *our* fetch to kai-assistant regardless of the
-// downstream heartbeat we send the browser (that heartbeat only keeps the
-// browser<->server leg alive). Use a long but finite timeout - long enough
-// for any real answer, but bounded so a genuinely dead upstream connection
-// still gets cleaned up (and logged) instead of hanging forever.
+// Bounds how long we'll wait on kai-assistant itself (now purely a
+// server-side background operation, not tied to any browser connection) -
+// generous, but finite so a genuinely dead upstream still gets cleaned up
+// and logged instead of hanging forever.
 const UPSTREAM_TIMEOUT_MS = 15 * 60 * 1000;
 const longTimeoutDispatcher = new Agent({
   headersTimeout: UPSTREAM_TIMEOUT_MS,
@@ -74,53 +82,81 @@ async function discoverKaiUrl() {
 let requestCounter = 0;
 
 // Short, log-friendly id for correlating every line that belongs to one
-// proxyChat() call. Deliberately separate from the chat/message UUIDs
-// (which are also logged) - this one is just easy to grep for.
+// runChatStream() call. Deliberately separate from the chat/message/stream
+// UUIDs (also logged) - this one is just easy to grep for.
 function nextRequestId() {
   requestCounter += 1;
   return `k${requestCounter}`;
 }
 
-// Forwards `payload` to kai-assistant's /api/chat and pipes the SSE response
-// straight through to `res`. Used both for new user messages and for
-// tool-approval responses (see src/routes/kai.js) - both are just different
-// message payloads against the same streaming endpoint.
-//
-// Every call gets its own reqId and a start/end log line, unlike
-// discoverKaiUrl()'s 'kai:discovered' which only ever logs once per process
-// (it's cached) - without this, any chat message after the first one in a
-// server's lifetime produced zero log output until it either finished or
-// errored, so a request that just hung was invisible.
-async function proxyChat(payload, res) {
+// streamId -> { events: [{seq,type,data}], done, error, createdAt, lastAccess }
+const streamBuffers = new Map();
+const STREAM_BUFFER_TTL_MS = 30 * 60 * 1000;
+
+function createStreamBuffer() {
+  const streamId = crypto.randomUUID();
+  streamBuffers.set(streamId, {
+    events: [],
+    done: false,
+    error: null,
+    createdAt: Date.now(),
+    lastAccess: Date.now(),
+  });
+  return streamId;
+}
+
+// Sweeps buffers nobody has polled in a while so a long-running server
+// process doesn't accumulate them forever. unref()'d so it never keeps the
+// process alive on its own.
+setInterval(() => {
+  const cutoff = Date.now() - STREAM_BUFFER_TTL_MS;
+  for (const [id, buf] of streamBuffers) {
+    if (buf.lastAccess < cutoff) streamBuffers.delete(id);
+  }
+}, 5 * 60 * 1000).unref();
+
+// Splits one "\n\n"-delimited SSE part into its data-only lines. Kai's SSE
+// format has no "event:" lines - the type is inside the JSON body.
+function* parseSSEPart(part) {
+  for (const line of part.split('\n')) {
+    if (!line.startsWith('data:')) continue;
+    const raw = line.slice(5).trim();
+    if (raw === '[DONE]') continue;
+    try {
+      const data = JSON.parse(raw);
+      yield { type: data.type || 'unknown', data };
+    } catch {
+      // skip unparseable lines
+    }
+  }
+}
+
+// Does the actual work: discovers kai-assistant, forwards `payload`, reads
+// its SSE response, and pushes parsed events into the buffer for `streamId`
+// as they arrive. Runs detached from any browser connection (see
+// startChat) - a request here can safely take minutes; nothing is waiting
+// on this HTTP response.
+async function runChatStream(streamId, payload) {
+  const buf = streamBuffers.get(streamId);
   const reqId = nextRequestId();
   const chatId = payload?.id;
   const partTypes = (payload?.message?.parts || []).map((p) => p?.type);
-
-  if (!isConfigured()) {
-    const status = configStatus();
-    logger.error('kai:not-configured', { reqId, chatId, ...status });
-    const err = new Error(
-      'Kai is not configured for this app (missing KBC_URL / KAI_TOKEN). ' +
-        'Set these as environment variables, then redeploy.'
-    );
-    err.code = 'KAI_NOT_CONFIGURED';
-    err.status = 503;
-    throw err;
-  }
-
   const startedAt = Date.now();
-  logger.info('kai:chat-request-start', { reqId, chatId, partTypes });
+
+  logger.info('kai:chat-request-start', { reqId, chatId, streamId, partTypes });
 
   let kaiUrl;
   try {
     kaiUrl = await discoverKaiUrl();
   } catch (err) {
-    logger.error('kai:discovery-failed', { reqId, chatId, error: err.message, durationMs: Date.now() - startedAt });
-    throw err;
+    logger.error('kai:discovery-failed', { reqId, chatId, streamId, error: err.message, durationMs: Date.now() - startedAt });
+    buf.error = err.message;
+    buf.done = true;
+    return;
   }
-  const workspaceId = getWorkspaceId();
 
-  logger.info('kai:discovery-ok', { reqId, chatId, hasWorkspaceId: Boolean(workspaceId), waitedMs: Date.now() - startedAt });
+  const workspaceId = getWorkspaceId();
+  logger.info('kai:discovery-ok', { reqId, chatId, streamId, hasWorkspaceId: Boolean(workspaceId), waitedMs: Date.now() - startedAt });
 
   let upstream;
   try {
@@ -140,110 +176,119 @@ async function proxyChat(payload, res) {
     // the connection, DNS failed, or our own fetch's timeout tripped. `cause`
     // is where undici puts the actual socket/protocol-level error.
     logger.error('kai:upstream-fetch-failed', {
-      reqId,
-      chatId,
-      error: err.message,
-      cause: err.cause?.message,
-      durationMs: Date.now() - startedAt,
+      reqId, chatId, streamId, error: err.message, cause: err.cause?.message, durationMs: Date.now() - startedAt,
     });
-    throw err;
+    buf.error = err.message;
+    buf.done = true;
+    return;
   }
 
   logger.info('kai:upstream-headers-received', {
-    reqId,
-    chatId,
-    status: upstream.status,
-    contentType: upstream.headers.get('content-type'),
-    waitedMs: Date.now() - startedAt,
+    reqId, chatId, streamId, status: upstream.status,
+    contentType: upstream.headers.get('content-type'), waitedMs: Date.now() - startedAt,
   });
 
   if (!upstream.ok) {
     const text = await upstream.text();
-    logger.error('kai:upstream-error', { reqId, chatId, status: upstream.status, body: text });
-    res.status(upstream.status).json({ error: text || `Kai returned ${upstream.status}` });
+    logger.error('kai:upstream-error', { reqId, chatId, streamId, status: upstream.status, body: text });
+    buf.error = text || `Kai returned ${upstream.status}`;
+    buf.done = true;
     return;
   }
 
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-
-  // Once the browser disconnects (tab closed, fetch aborted, an
-  // intermediate proxy dropped it), stop doing pointless work: skip further
-  // heartbeats/writes and cancel the upstream read early instead of reading
-  // out a full response nobody's listening for. Logging exactly when/if this
-  // fires (and how that compares to when the user actually saw an error) is
-  // the main thing missing from earlier diagnostics.
-  let clientClosed = false;
-  res.on('close', () => {
-    clientClosed = true;
-    logger.info('kai:client-disconnected', { reqId, chatId, elapsedMs: Date.now() - startedAt });
-  });
-  res.on('error', (err) => {
-    logger.warn('kai:response-error', { reqId, chatId, error: err.message, elapsedMs: Date.now() - startedAt });
-  });
-
-  // kai-assistant can go quiet for a while mid-response (thinking, or
-  // running a tool), during which zero bytes flow. A proxy sitting between
-  // the browser and here can treat that silence as a dead connection and
-  // drop it - which reaches the user as a bare "network error" with no
-  // useful detail. A periodic SSE comment line keeps bytes flowing so
-  // nothing in the chain idle-times-out the connection; comment lines
-  // (leading ":") are already ignored by the frontend's parser, which only
-  // reads "data:" lines.
-  let heartbeatCount = 0;
-  const heartbeat = setInterval(() => {
-    if (clientClosed) {
-      clearInterval(heartbeat);
-      return;
-    }
-    heartbeatCount += 1;
-    res.write(': heartbeat\n\n');
-  }, 15000);
-
   const reader = upstream.body.getReader();
   const decoder = new TextDecoder();
-  let bytesReceived = 0;
+  let sseBuffer = '';
   let chunkCount = 0;
+  let eventCount = 0;
+
   try {
     while (true) {
-      if (clientClosed) {
-        await reader.cancel();
-        logger.info('kai:chat-aborted', {
-          reqId, chatId, durationMs: Date.now() - startedAt, heartbeatCount, chunkCount, bytesReceived,
-        });
-        return;
-      }
       const { done, value } = await reader.read();
       if (done) break;
       chunkCount += 1;
-      bytesReceived += value.byteLength;
-      res.write(decoder.decode(value, { stream: true }));
+      sseBuffer += decoder.decode(value, { stream: true });
+
+      const parts = sseBuffer.split('\n\n');
+      sseBuffer = parts.pop();
+      for (const part of parts) {
+        if (!part.trim()) continue;
+        for (const event of parseSSEPart(part)) {
+          buf.events.push(event);
+          eventCount += 1;
+        }
+      }
     }
+    buf.done = true;
     logger.info('kai:chat-completed', {
-      reqId, chatId, durationMs: Date.now() - startedAt, heartbeatCount, chunkCount, bytesReceived,
+      reqId, chatId, streamId, durationMs: Date.now() - startedAt, chunkCount, eventCount,
     });
   } catch (err) {
+    buf.error = err.message;
+    buf.done = true;
     logger.error('kai:stream-interrupted', {
-      reqId, chatId, error: err.message, cause: err.cause?.message,
-      durationMs: Date.now() - startedAt, heartbeatCount, chunkCount, bytesReceived,
+      reqId, chatId, streamId, error: err.message, cause: err.cause?.message,
+      durationMs: Date.now() - startedAt, chunkCount, eventCount,
     });
+  }
+}
+
+// Starts a chat turn (new message or tool-approval response - both are just
+// different payloads against the same kai-assistant endpoint) and returns a
+// streamId to poll via readStreamEvents. Synchronous except for the
+// isConfigured check, so callers get an immediate response either way.
+function startChat(payload) {
+  if (!isConfigured()) {
+    const status = configStatus();
+    logger.error('kai:not-configured', status);
+    const err = new Error(
+      'Kai is not configured for this app (missing KBC_URL / KAI_TOKEN). ' +
+        'Set these as environment variables, then redeploy.'
+    );
+    err.code = 'KAI_NOT_CONFIGURED';
+    err.status = 503;
     throw err;
-  } finally {
-    clearInterval(heartbeat);
   }
 
-  if (!clientClosed) res.end();
+  const streamId = createStreamBuffer();
+  runChatStream(streamId, payload).catch((err) => {
+    // runChatStream already catches and records its own errors on the
+    // buffer - this only guards against a genuinely unexpected throw so it
+    // can't become an unhandled promise rejection.
+    logger.error('kai:stream-worker-crashed', { streamId, error: err.message });
+    const buf = streamBuffers.get(streamId);
+    if (buf) {
+      buf.error = err.message;
+      buf.done = true;
+    }
+  });
+
+  return streamId;
+}
+
+// Returns events buffered since sequence `since`, plus done/error state.
+function readStreamEvents(streamId, since) {
+  const buf = streamBuffers.get(streamId);
+  if (!buf) {
+    const err = new Error('Unknown or expired chat stream.');
+    err.status = 404;
+    throw err;
+  }
+  buf.lastAccess = Date.now();
+
+  return {
+    events: buf.events.slice(since),
+    nextSeq: buf.events.length,
+    done: buf.done,
+    error: buf.error,
+  };
 }
 
 // GET /api/chat/{chatId} returns the chat's current state (messages so far)
-// directly from kai-assistant - a plain request/response, not a stream, so
-// it isn't subject to whatever cut the SSE connection short. kai-assistant
-// keeps working on a request server-side independent of whether our
-// downstream connection to the browser survives, so this lets the frontend
-// recover an answer that finished after the browser already saw a dropped
-// connection (see src/routes/kai.js and the "Check if it finished" action
-// in static/kai.js).
+// directly from kai-assistant - independent of any stream buffer here, so
+// it still works even if a buffer already expired or the server restarted
+// mid-conversation. Used by the frontend's "Check if it finished" fallback
+// in static/kai.js.
 async function fetchChat(chatId) {
   const reqId = nextRequestId();
   const startedAt = Date.now();
@@ -284,6 +329,7 @@ async function fetchChat(chatId) {
 module.exports = {
   isConfigured,
   configStatus,
-  proxyChat,
+  startChat,
+  readStreamEvents,
   fetchChat,
 };

@@ -204,57 +204,52 @@ function renderSuggestions(suggestions) {
     });
 }
 
-// Kai's SSE uses data-only lines with the event type inside the JSON body -
-// no "event:" lines, so parsing is just picking out "data:" lines.
-function* parseSSEChunk(text) {
-    for (const line of text.split('\n')) {
-        if (!line.startsWith('data:')) continue;
-        const raw = line.slice(5).trim();
-        if (raw === '[DONE]') continue;
-        try {
-            const data = JSON.parse(raw);
-            yield { type: data.type || 'unknown', data };
-        } catch {
-            // skip unparseable lines
-        }
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+const POLL_INTERVAL_MS = 1200;
+
+// Reads a JSON error body's `.error` field if present, falling back to the
+// raw text.
+async function readErrorBody(res) {
+    const text = await res.text();
+    try {
+        return JSON.parse(text).error || text;
+    } catch {
+        return text;
     }
 }
 
-async function readSSEStream(url, fetchOptions, onEvent) {
-    const res = await fetch(url, fetchOptions);
-    if (!res.ok) {
-        const text = await res.text();
-        let message = text;
-        try {
-            message = JSON.parse(text).error || text;
-        } catch {
-            // plain text error, use as-is
-        }
-        addChatError(message || `Request failed (${res.status})`);
-        return null;
+// Starts a chat turn at `url` (POST /api/chat or an approval endpoint) and
+// polls for its buffered events instead of holding one connection open for
+// the whole answer. The Keboola Data Apps platform proxy in front of this
+// app enforces a hard 30s timeout on any plain HTTP request regardless of
+// activity (confirmed via platform traces - only WebSockets are exempt
+// there), so a Kai answer involving several tool calls routinely exceeds
+// it. Every request here - the start, and each poll - completes in well
+// under a second, so that cap never applies.
+async function runChat(url, fetchOptions, onEvent) {
+    const startRes = await fetch(url, fetchOptions);
+    if (!startRes.ok) {
+        throw new Error((await readErrorBody(startRes)) || `Request failed (${startRes.status})`);
     }
+    const { streamId } = await startRes.json();
 
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-
-    while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const parts = buffer.split('\n\n');
-        buffer = parts.pop();
-
-        for (const part of parts) {
-            if (!part.trim()) continue;
-            for (const event of parseSSEChunk(part + '\n\n')) {
-                onEvent(event);
-            }
+    let since = 0;
+    for (;;) {
+        const res = await fetch(`/api/chat/stream/${streamId}/events?since=${since}`);
+        if (!res.ok) {
+            throw new Error((await readErrorBody(res)) || `Poll failed (${res.status})`);
         }
-    }
+        const data = await res.json();
+        for (const event of data.events) onEvent(event);
+        since = data.nextSeq;
 
-    return res;
+        if (data.error) throw new Error(data.error);
+        if (data.done) return;
+        await sleep(POLL_INTERVAL_MS);
+    }
 }
 
 function handleStreamEvent(content, accumulatedRef, toolNames) {
@@ -320,7 +315,7 @@ async function sendMessage(text) {
     };
 
     try {
-        const res = await readSSEStream(
+        await runChat(
             '/api/chat',
             {
                 method: 'POST',
@@ -330,9 +325,7 @@ async function sendMessage(text) {
             handleStreamEvent(content, accumulatedRef, toolNames)
         );
 
-        if (!res) {
-            content.remove();
-        } else if (accumulatedRef.text) {
+        if (accumulatedRef.text) {
             const { body, suggestions } = extractSuggestions(accumulatedRef.text);
             content.innerHTML = renderMarkdown(body);
             if (suggestions.length) renderSuggestions(suggestions);
@@ -376,12 +369,12 @@ async function handleApproval(approved) {
 
     const action = approved ? 'approve' : 'reject';
     try {
-        const res = await readSSEStream(
+        await runChat(
             `/api/chat/${chatId}/${action}/${approvalId}`,
             { method: 'POST', headers: { 'Content-Type': 'application/json' } },
             handleStreamEvent(content, accumulatedRef, toolNames)
         );
-        if (res) content.innerHTML = renderMarkdown(accumulatedRef.text);
+        content.innerHTML = renderMarkdown(accumulatedRef.text);
     } catch (err) {
         addChatError(describeConnectionError(err, startedAt));
     }
