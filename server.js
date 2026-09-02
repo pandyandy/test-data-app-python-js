@@ -2,7 +2,9 @@ const path = require('path');
 const express = require('express');
 const logger = require('./src/logger');
 const queryService = require('./src/queryService');
+const kaiService = require('./src/kaiService');
 const employeesRouter = require('./src/routes/employees');
+const kaiRouter = require('./src/routes/kai');
 const { PORT } = require('./src/config');
 
 const app = express();
@@ -23,9 +25,10 @@ app.use((req, res, next) => {
 });
 
 app.use('/api/employees', employeesRouter);
+app.use('/api', kaiRouter);
 
 app.get('/api/status', (req, res) => {
-  res.json({ storageAccess: queryService.configStatus() });
+  res.json({ storageAccess: queryService.configStatus(), kai: kaiService.configStatus() });
 });
 
 app.get('/api/logs', (req, res) => {

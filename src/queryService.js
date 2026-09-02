@@ -275,4 +275,5 @@ module.exports = {
   executeQuery,
   sqlString,
   sqlIdent,
+  getWorkspaceId,
 };

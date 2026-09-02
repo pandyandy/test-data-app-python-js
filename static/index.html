@@ -32,6 +32,26 @@
             <p id="emptyState" class="empty-state" hidden>No employees yet. Click "Add employee" to create the first row.</p>
         </section>
 
+        <section class="panel chat-panel">
+            <div class="panel-header">
+                <h2>Kai chat</h2>
+                <button id="newChatBtn" class="btn btn-secondary">New chat</button>
+            </div>
+            <div id="chatMessages" class="chat-messages"></div>
+            <div id="chatApproval" class="chat-approval" hidden>
+                <span>A tool needs your approval before it runs.</span>
+                <div class="chat-approval-actions">
+                    <button id="chatApproveBtn" class="btn btn-primary btn-small">Approve</button>
+                    <button id="chatDenyBtn" class="btn btn-secondary btn-small">Deny</button>
+                </div>
+            </div>
+            <div id="chatSuggestions" class="chat-suggestions"></div>
+            <form id="chatForm" class="chat-form">
+                <input type="text" id="chatInput" placeholder="Ask Kai about your Keboola project…" autocomplete="off">
+                <button type="submit" id="chatSendBtn" class="btn btn-primary">Send</button>
+            </form>
+        </section>
+
         <section class="panel">
             <div class="panel-header">
                 <h2>Activity log</h2>
@@ -44,5 +64,6 @@
     </div>
 
     <script src="app.js"></script>
+    <script src="kai.js"></script>
 </body>
 </html>
