@@ -26,6 +26,17 @@ function setStreaming(value) {
     chatInput.disabled = value;
 }
 
+// "Connection error: network error" alone isn't enough to diagnose anything.
+// Logs full detail (name, message, stack) to the console and returns a
+// display string carrying the error type, elapsed time, and chat id - the
+// chat id lets you match this failure against the server's activity log,
+// which now logs it on every kai:* line for the same request.
+function describeConnectionError(err, startedAt) {
+    const elapsedS = ((performance.now() - startedAt) / 1000).toFixed(1);
+    console.error('[kai] connection error', { name: err.name, message: err.message, chatId, elapsedS, err });
+    return `Connection error: ${err.name || 'Error'}: ${err.message} (chat ${chatId.slice(0, 8)}, after ${elapsedS}s)`;
+}
+
 function escapeHtml(text) {
     const div = document.createElement('div');
     div.textContent = text;
@@ -292,6 +303,7 @@ async function sendMessage(text) {
     addUserMessage(text);
     setStreaming(true);
 
+    const startedAt = performance.now();
     const content = createAssistantMessage();
     const accumulatedRef = { text: '' };
     const toolNames = {};
@@ -339,7 +351,7 @@ async function sendMessage(text) {
             content.remove();
         }
 
-        addChatErrorWithActions(`Connection error: ${err.message}`, [
+        addChatErrorWithActions(describeConnectionError(err, startedAt), [
             { label: 'Check if it finished', onClick: () => checkIfFinished(content, accumulatedRef, text) },
             { label: 'Retry', onClick: () => sendMessage(text) },
         ]);
@@ -357,6 +369,7 @@ async function handleApproval(approved) {
     pendingApproval = null;
 
     setStreaming(true);
+    const startedAt = performance.now();
     const content = createAssistantMessage();
     const accumulatedRef = { text: '' };
     const toolNames = {};
@@ -370,7 +383,7 @@ async function handleApproval(approved) {
         );
         if (res) content.innerHTML = renderMarkdown(accumulatedRef.text);
     } catch (err) {
-        addChatError(`Connection error: ${err.message}`);
+        addChatError(describeConnectionError(err, startedAt));
     }
 
     setStreaming(false);

@@ -71,14 +71,34 @@ async function discoverKaiUrl() {
   return cachedKaiUrl;
 }
 
+let requestCounter = 0;
+
+// Short, log-friendly id for correlating every line that belongs to one
+// proxyChat() call. Deliberately separate from the chat/message UUIDs
+// (which are also logged) - this one is just easy to grep for.
+function nextRequestId() {
+  requestCounter += 1;
+  return `k${requestCounter}`;
+}
+
 // Forwards `payload` to kai-assistant's /api/chat and pipes the SSE response
 // straight through to `res`. Used both for new user messages and for
 // tool-approval responses (see src/routes/kai.js) - both are just different
 // message payloads against the same streaming endpoint.
+//
+// Every call gets its own reqId and a start/end log line, unlike
+// discoverKaiUrl()'s 'kai:discovered' which only ever logs once per process
+// (it's cached) - without this, any chat message after the first one in a
+// server's lifetime produced zero log output until it either finished or
+// errored, so a request that just hung was invisible.
 async function proxyChat(payload, res) {
+  const reqId = nextRequestId();
+  const chatId = payload?.id;
+  const partTypes = (payload?.message?.parts || []).map((p) => p?.type);
+
   if (!isConfigured()) {
     const status = configStatus();
-    logger.error('kai:not-configured', status);
+    logger.error('kai:not-configured', { reqId, chatId, ...status });
     const err = new Error(
       'Kai is not configured for this app (missing KBC_URL / KAI_TOKEN). ' +
         'Set these as environment variables, then redeploy.'
@@ -88,24 +108,58 @@ async function proxyChat(payload, res) {
     throw err;
   }
 
-  const kaiUrl = await discoverKaiUrl();
+  const startedAt = Date.now();
+  logger.info('kai:chat-request-start', { reqId, chatId, partTypes });
+
+  let kaiUrl;
+  try {
+    kaiUrl = await discoverKaiUrl();
+  } catch (err) {
+    logger.error('kai:discovery-failed', { reqId, chatId, error: err.message, durationMs: Date.now() - startedAt });
+    throw err;
+  }
   const workspaceId = getWorkspaceId();
 
-  const upstream = await fetch(`${kaiUrl}/api/chat`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-storageapi-token': KAI_TOKEN,
-      'x-storageapi-url': KBC_URL,
-      ...(workspaceId && { 'x-workspace-id': workspaceId }),
-    },
-    body: JSON.stringify(payload),
-    dispatcher: longTimeoutDispatcher,
+  logger.info('kai:discovery-ok', { reqId, chatId, hasWorkspaceId: Boolean(workspaceId), waitedMs: Date.now() - startedAt });
+
+  let upstream;
+  try {
+    upstream = await fetch(`${kaiUrl}/api/chat`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-storageapi-token': KAI_TOKEN,
+        'x-storageapi-url': KBC_URL,
+        ...(workspaceId && { 'x-workspace-id': workspaceId }),
+      },
+      body: JSON.stringify(payload),
+      dispatcher: longTimeoutDispatcher,
+    });
+  } catch (err) {
+    // Thrown before we get any response at all - e.g. kai-assistant refused
+    // the connection, DNS failed, or our own fetch's timeout tripped. `cause`
+    // is where undici puts the actual socket/protocol-level error.
+    logger.error('kai:upstream-fetch-failed', {
+      reqId,
+      chatId,
+      error: err.message,
+      cause: err.cause?.message,
+      durationMs: Date.now() - startedAt,
+    });
+    throw err;
+  }
+
+  logger.info('kai:upstream-headers-received', {
+    reqId,
+    chatId,
+    status: upstream.status,
+    contentType: upstream.headers.get('content-type'),
+    waitedMs: Date.now() - startedAt,
   });
 
   if (!upstream.ok) {
     const text = await upstream.text();
-    logger.error('kai:upstream-error', { status: upstream.status, body: text });
+    logger.error('kai:upstream-error', { reqId, chatId, status: upstream.status, body: text });
     res.status(upstream.status).json({ error: text || `Kai returned ${upstream.status}` });
     return;
   }
@@ -117,12 +171,16 @@ async function proxyChat(payload, res) {
   // Once the browser disconnects (tab closed, fetch aborted, an
   // intermediate proxy dropped it), stop doing pointless work: skip further
   // heartbeats/writes and cancel the upstream read early instead of reading
-  // out a full response nobody's listening for. The 'error' listener is
-  // just cheap insurance against a write-after-close throwing.
+  // out a full response nobody's listening for. Logging exactly when/if this
+  // fires (and how that compares to when the user actually saw an error) is
+  // the main thing missing from earlier diagnostics.
   let clientClosed = false;
-  res.on('close', () => { clientClosed = true; });
+  res.on('close', () => {
+    clientClosed = true;
+    logger.info('kai:client-disconnected', { reqId, chatId, elapsedMs: Date.now() - startedAt });
+  });
   res.on('error', (err) => {
-    logger.warn('kai:response-error', { error: err.message });
+    logger.warn('kai:response-error', { reqId, chatId, error: err.message, elapsedMs: Date.now() - startedAt });
   });
 
   // kai-assistant can go quiet for a while mid-response (thinking, or
@@ -133,31 +191,43 @@ async function proxyChat(payload, res) {
   // nothing in the chain idle-times-out the connection; comment lines
   // (leading ":") are already ignored by the frontend's parser, which only
   // reads "data:" lines.
+  let heartbeatCount = 0;
   const heartbeat = setInterval(() => {
     if (clientClosed) {
       clearInterval(heartbeat);
       return;
     }
+    heartbeatCount += 1;
     res.write(': heartbeat\n\n');
   }, 15000);
 
   const reader = upstream.body.getReader();
   const decoder = new TextDecoder();
-  const startedAt = Date.now();
+  let bytesReceived = 0;
+  let chunkCount = 0;
   try {
     while (true) {
       if (clientClosed) {
         await reader.cancel();
-        logger.info('kai:chat-aborted', { durationMs: Date.now() - startedAt });
+        logger.info('kai:chat-aborted', {
+          reqId, chatId, durationMs: Date.now() - startedAt, heartbeatCount, chunkCount, bytesReceived,
+        });
         return;
       }
       const { done, value } = await reader.read();
       if (done) break;
+      chunkCount += 1;
+      bytesReceived += value.byteLength;
       res.write(decoder.decode(value, { stream: true }));
     }
-    logger.info('kai:chat-completed', { durationMs: Date.now() - startedAt });
+    logger.info('kai:chat-completed', {
+      reqId, chatId, durationMs: Date.now() - startedAt, heartbeatCount, chunkCount, bytesReceived,
+    });
   } catch (err) {
-    logger.error('kai:stream-interrupted', { error: err.message, durationMs: Date.now() - startedAt });
+    logger.error('kai:stream-interrupted', {
+      reqId, chatId, error: err.message, cause: err.cause?.message,
+      durationMs: Date.now() - startedAt, heartbeatCount, chunkCount, bytesReceived,
+    });
     throw err;
   } finally {
     clearInterval(heartbeat);
@@ -175,6 +245,9 @@ async function proxyChat(payload, res) {
 // connection (see src/routes/kai.js and the "Check if it finished" action
 // in static/kai.js).
 async function fetchChat(chatId) {
+  const reqId = nextRequestId();
+  const startedAt = Date.now();
+
   if (!isConfigured()) {
     const err = new Error('Kai is not configured for this app (missing KBC_URL / KAI_TOKEN).');
     err.status = 503;
@@ -183,6 +256,8 @@ async function fetchChat(chatId) {
 
   const kaiUrl = await discoverKaiUrl();
   const workspaceId = getWorkspaceId();
+
+  logger.info('kai:fetch-chat-start', { reqId, chatId });
 
   const res = await fetch(`${kaiUrl}/api/chat/${encodeURIComponent(chatId)}`, {
     headers: {
@@ -194,11 +269,15 @@ async function fetchChat(chatId) {
 
   if (!res.ok) {
     const text = await res.text();
+    logger.error('kai:fetch-chat-error', {
+      reqId, chatId, status: res.status, body: text, durationMs: Date.now() - startedAt,
+    });
     const err = new Error(text || `Kai returned ${res.status}`);
     err.status = res.status;
     throw err;
   }
 
+  logger.info('kai:fetch-chat-completed', { reqId, chatId, durationMs: Date.now() - startedAt });
   return res.json();
 }
 
