@@ -98,12 +98,31 @@ async function proxyChat(payload, res) {
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
 
+  // kai-assistant can go quiet for a while mid-response (thinking, or
+  // running a tool), during which zero bytes flow. A proxy sitting between
+  // the browser and here can treat that silence as a dead connection and
+  // drop it - which reaches the user as a bare "network error" with no
+  // useful detail. A periodic SSE comment line keeps bytes flowing so
+  // nothing in the chain idle-times-out the connection; comment lines
+  // (leading ":") are already ignored by the frontend's parser, which only
+  // reads "data:" lines.
+  const heartbeat = setInterval(() => {
+    res.write(': heartbeat\n\n');
+  }, 15000);
+
   const reader = upstream.body.getReader();
   const decoder = new TextDecoder();
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    res.write(decoder.decode(value, { stream: true }));
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      res.write(decoder.decode(value, { stream: true }));
+    }
+  } catch (err) {
+    logger.error('kai:stream-interrupted', { error: err.message });
+    throw err;
+  } finally {
+    clearInterval(heartbeat);
   }
   res.end();
 }

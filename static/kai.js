@@ -108,6 +108,29 @@ function addChatError(text) {
     scrollChatToBottom();
 }
 
+// Like addChatError, but with a Retry button - used when the connection
+// itself dropped (as opposed to Kai returning an error response), so the
+// user's question is still worth resending rather than retyping.
+function addChatErrorWithRetry(text, onRetry) {
+    const div = document.createElement('div');
+    div.className = 'chat-error';
+    const message = document.createElement('span');
+    message.textContent = text;
+    div.appendChild(message);
+
+    const retryBtn = document.createElement('button');
+    retryBtn.className = 'btn btn-secondary btn-small chat-retry-btn';
+    retryBtn.textContent = 'Retry';
+    retryBtn.addEventListener('click', () => {
+        div.remove();
+        onRetry();
+    });
+    div.appendChild(retryBtn);
+
+    chatMessages.appendChild(div);
+    scrollChatToBottom();
+}
+
 function renderSuggestions(suggestions) {
     chatSuggestions.innerHTML = '';
     suggestions.forEach((text) => {
@@ -257,8 +280,15 @@ async function sendMessage(text) {
             content.remove();
         }
     } catch (err) {
-        content.remove();
-        addChatError(`Connection error: ${err.message}`);
+        // The connection dropped mid-stream rather than Kai returning an
+        // error - keep whatever text made it through (if any) and offer a
+        // retry instead of silently discarding the question.
+        if (accumulatedRef.text) {
+            content.innerHTML = renderMarkdown(accumulatedRef.text);
+        } else {
+            content.remove();
+        }
+        addChatErrorWithRetry(`Connection error: ${err.message}`, () => sendMessage(text));
     }
 
     setStreaming(false);
