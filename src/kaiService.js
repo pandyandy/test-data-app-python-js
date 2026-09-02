@@ -13,8 +13,18 @@
 // auth headers attached, streaming the SSE response straight back to the
 // caller.
 
+const { Agent } = require('undici');
 const logger = require('./logger');
 const { getWorkspaceId } = require('./queryService');
+
+// Node's built-in fetch (undici) defaults to killing a request after 300s
+// without any bytes received - headers or body. A complex Kai answer can go
+// quiet for longer than that while it's thinking or running a tool, which
+// would otherwise abort *our* fetch to kai-assistant regardless of the
+// downstream heartbeat we send the browser (that heartbeat only keeps the
+// browser<->server leg alive). Disable both timeouts for this one dispatcher
+// so only kai-assistant's own connection lifetime governs how long we wait.
+const noTimeoutDispatcher = new Agent({ headersTimeout: 0, bodyTimeout: 0 });
 
 const KBC_URL = process.env.KBC_URL || process.env.STORAGE_API_URL;
 // Separate from queryService's KBC_TOKEN: discovering kai-assistant and
@@ -85,6 +95,7 @@ async function proxyChat(payload, res) {
       ...(workspaceId && { 'x-workspace-id': workspaceId }),
     },
     body: JSON.stringify(payload),
+    dispatcher: noTimeoutDispatcher,
   });
 
   if (!upstream.ok) {
