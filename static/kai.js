@@ -319,7 +319,7 @@ fetch('/api/status')
         const kai = data.kai || {};
         if (!kai.hasStorageUrl || !kai.hasToken) {
             addChatError(
-                'Kai isn\'t configured for this app yet (missing KBC_URL / KBC_TOKEN environment variables).'
+                'Kai isn\'t configured for this app yet (missing KBC_URL / KAI_TOKEN environment variables).'
             );
         }
     })

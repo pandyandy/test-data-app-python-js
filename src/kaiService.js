@@ -17,18 +17,21 @@ const logger = require('./logger');
 const { getWorkspaceId } = require('./queryService');
 
 const KBC_URL = process.env.KBC_URL || process.env.STORAGE_API_URL;
-const KBC_TOKEN = process.env.KBC_TOKEN;
+// Separate from queryService's KBC_TOKEN: discovering kai-assistant and
+// calling it requires a master token, whereas KBC_TOKEN in this app's env is
+// scoped narrower (Storage Access only) and can't be reused here.
+const KAI_TOKEN = process.env.KAI_TOKEN;
 
 let cachedKaiUrl = null;
 
 function isConfigured() {
-  return Boolean(KBC_URL && KBC_TOKEN);
+  return Boolean(KBC_URL && KAI_TOKEN);
 }
 
 function configStatus() {
   return {
     hasStorageUrl: Boolean(KBC_URL),
-    hasToken: Boolean(KBC_TOKEN),
+    hasToken: Boolean(KAI_TOKEN),
   };
 }
 
@@ -36,7 +39,7 @@ async function discoverKaiUrl() {
   if (cachedKaiUrl) return cachedKaiUrl;
 
   const res = await fetch(`${KBC_URL.replace(/\/+$/, '')}/v2/storage`, {
-    headers: { 'X-StorageAPI-Token': KBC_TOKEN },
+    headers: { 'X-StorageAPI-Token': KAI_TOKEN },
   });
   if (!res.ok) {
     throw new Error(`Storage API discovery failed: ${res.status} ${res.statusText}`);
@@ -62,7 +65,7 @@ async function proxyChat(payload, res) {
     const status = configStatus();
     logger.error('kai:not-configured', status);
     const err = new Error(
-      'Kai is not configured for this app (missing KBC_URL / KBC_TOKEN). ' +
+      'Kai is not configured for this app (missing KBC_URL / KAI_TOKEN). ' +
         'Set these as environment variables, then redeploy.'
     );
     err.code = 'KAI_NOT_CONFIGURED';
@@ -77,7 +80,7 @@ async function proxyChat(payload, res) {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'x-storageapi-token': KBC_TOKEN,
+      'x-storageapi-token': KAI_TOKEN,
       'x-storageapi-url': KBC_URL,
       ...(workspaceId && { 'x-workspace-id': workspaceId }),
     },
